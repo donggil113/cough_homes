@@ -244,6 +244,165 @@ model = tf.keras.models.load_model('model.h5')
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
 tflite_model = converter.convert()
 
+import os
+import numpy as np
+import librosa
+import tensorflow as tf
+from transformers import ViTFeatureExtractor, TFAutoModelForImageClassification
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.utils import to_categorical
+
+# Load ViT feature extractor and model
+feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224')
+model = TFAutoModelForImageClassification.from_pretrained('google/vit-base-patch16-224', num_labels=len(labels))
+
+# Function to convert audio file to mel spectrogram
+def extract_mel_spectrogram(file_path):
+    audio, sample_rate = librosa.load(file_path, sr=None)
+    spectrogram = librosa.feature.melspectrogram(y=audio, sr=sample_rate, n_mels=128)
+    spectrogram = librosa.power_to_db(spectrogram, ref=np.max)
+    spectrogram = np.repeat(spectrogram[..., np.newaxis], 3, -1)  # Repeat to simulate RGB channels
+    return spectrogram
+
+# Preprocess audio files and extract features
+def preprocess_audio_files(data_path, labels):
+    features = []
+    labels_list = []
+
+    for label in labels:
+        folder_path = os.path.join(data_path, label)
+        for file_name in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, file_name)
+            file_path_wav = convert_to_wav(file_path)
+            trim_audio(file_path_wav)
+
+            # Extract mel spectrogram
+            spectrogram = extract_mel_spectrogram(file_path_wav)
+            features.append(spectrogram)
+            labels_list.append(label)
+
+            # Data augmentation
+            augmented_paths = augment_data(file_path_wav)
+            for augmented_path in augmented_paths:
+                spectrogram_aug = extract_mel_spectrogram(augmented_path)
+                features.append(spectrogram_aug)
+                labels_list.append(label)
+
+    return np.array(features), np.array([labels.index(label) for label in labels_list])
+
+# Load and preprocess data
+X, y = preprocess_audio_files(data_path, labels)
+
+# Normalize spectrogram data
+X = X / 255.0
+
+# One-hot encode labels
+y = to_categorical(y, num_classes=len(labels))
+
+# Split the dataset
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Train the model using ViT
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+history = model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_test, y_test))
+
+# Evaluate the model
+loss, accuracy = model.evaluate(X_test, y_test)
+print(f'Test Accuracy: {accuracy * 100:.2f}%')
+
+# Save the model
+model.save('cough_classification_transformer.h5')
+
+# Convert the model to TensorFlow Lite
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+tflite_model = converter.convert()
+
+# Save the TFLite model
+with open('cough_classification_transformer.tflite', 'wb') as f:
+    f.write(tflite_model)
+
+import numpy as np
+import shap
+import matplotlib.pyplot as plt
+from tensorflow.keras.models import load_model
+from transformers import ViTFeatureExtractor
+
+# Load the pre-trained model
+model = load_model('cough_classification_transformer.h5')
+
+# Load the feature extractor
+feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224')
+
+# SHAP expects the model output probabilities
+model.probabilities = lambda x: model.predict(x, verbose=0)
+
+# Function to preprocess a single audio file and get the mel spectrogram
+def preprocess_single_audio(file_path):
+    file_path_wav = convert_to_wav(file_path)
+    trim_audio(file_path_wav)
+    spectrogram = extract_mel_spectrogram(file_path_wav)
+    spectrogram = spectrogram / 255.0  # Normalize
+    spectrogram = np.expand_dims(spectrogram, axis=0)  # Add batch dimension
+    return spectrogram
+
+# Generate a background dataset (you can use a subset of your training data)
+X_background = X_train[:100]  # Assuming X_train is the training data array
+
+# Create SHAP explainer
+explainer = shap.KernelExplainer(model.probabilities, X_background)
+
+# Function to explain predictions
+def explain_prediction_shap(file_path):
+    spectrogram = preprocess_single_audio(file_path)
+    shap_values = explainer.shap_values(spectrogram)
+    
+    # Plot the explanation
+    plt.figure(figsize=(10, 5))
+    shap.image_plot(shap_values, -spectrogram)
+    plt.show()
+
+# Example of explaining a prediction
+explain_prediction_shap('audio_file.wav')
+
+# Define a function to predict the probabilities for LIME
+def predict_proba(images):
+    images = np.array([gray2rgb(img) for img in images])  # Convert to 3 channels
+    images = images / 255.0  # Normalize
+    return model.predict(images)
+
+# Create a LIME image explainer
+explainer = lime_image.LimeImageExplainer()
+
+# Function to explain predictions using LIME
+def explain_prediction_lime(file_path):
+    # Preprocess the audio to get a spectrogram
+    spectrogram = preprocess_single_audio(file_path)
+    spectrogram_rgb = gray2rgb(spectrogram)  # Convert to RGB format expected by LIME
+
+    # Explain the model's prediction
+    explanation = explainer.explain_instance(
+        spectrogram_rgb, 
+        classifier_fn=predict_proba,
+        top_labels=1,
+        hide_color=0,
+        num_samples=1000
+    )
+
+    # Get the explanation for the top class
+    temp, mask = explanation.get_image_and_mask(
+        explanation.top_labels[0], 
+        positive_only=True, 
+        num_features=10, 
+        hide_rest=True
+    )
+
+    # Display the explanation
+    plt.imshow(temp, interpolation='nearest')
+    plt.show()
+
+# Example of explaining a prediction
+explain_prediction_lime('audio_file.wav')
+
 # 모델 저장
 with open('model.tflite', 'wb') as f:
     f.write(tflite_model)
